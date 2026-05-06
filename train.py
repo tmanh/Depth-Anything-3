@@ -202,11 +202,13 @@ class ColorImageDataset(Dataset):
         train_ratio: float = 0.98,
         seed: int = 42,
         enable_augmentation: bool = True,
+        depths_root: str | None = None,
     ):
         self.data_root = Path(data_root)
         self.img_size = img_size
         self.split = split
         self.enable_augmentation = enable_augmentation
+        self.depths_root = Path(depths_root) if depths_root else None
 
         if split not in {"train", "val", "all"}:
             raise ValueError("split must be one of: train, val, all")
@@ -302,26 +304,64 @@ class ColorImageDataset(Dataset):
         out = TF.adjust_hue(out, hue)
         return out.clamp(0.0, 1.0)
 
-    def _simulate_underwater(self, img: torch.Tensor) -> torch.Tensor:
+    def _simulate_underwater(
+        self, img: torch.Tensor, depth: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """
         Underwater simulation from a clean RGB tensor [0, 1].
 
-        Effects included:
+        Effects include:
         1) Wavelength-dependent attenuation (red attenuates most)
         2) Forward scatter / veiling light (blue-green haze)
         3) Slight blur and sensor noise
         4) Contrast reduction and mild gamma shift
+
+        If depth is provided, uses it to drive physically plausible parameters:
+        - Attenuation coefficients scale with mean depth
+        - Haze strength increases with depth
+        - Blur correlates with depth
+        Otherwise, uses random heuristic parameters.
+
+        Args:
+            img: RGB image tensor [0, 1] of shape (3, H, W)
+            depth: Optional depth map (H, W) in meters. If None, uses random parameters.
         """
         c, h, w = img.shape
         if c != 3:
             raise ValueError("Expected 3-channel RGB tensor.")
 
-        # Random attenuation coefficients (stronger for red channel).
-        beta_r = random.uniform(1.8, 3.2)
-        beta_g = random.uniform(0.8, 1.8)
-        beta_b = random.uniform(0.3, 1.0)
-        # Pseudo-depth scalar controls global water thickness.
-        water_depth = random.uniform(0.4, 1.8)
+        # If depth is provided, use it to drive the simulation parameters
+        if depth is not None:
+            depth_np = depth.cpu().numpy() if isinstance(depth, torch.Tensor) else depth
+            # Compute mean and variance of depth (clamp to avoid NaN)
+            depth_valid = depth_np[depth_np > 0.1]
+            if depth_valid.size > 0:
+                mean_depth = float(np.mean(depth_valid))
+                # Clamp mean depth for stability
+                mean_depth = np.clip(mean_depth, 0.1, 10.0)
+            else:
+                mean_depth = 1.0
+
+            # Scale attenuation coefficients with depth (deeper = more attenuation)
+            depth_scale = np.clip(mean_depth / 5.0, 0.5, 2.0)  # normalize to ~1.0 at 5m
+            beta_r = np.clip(random.uniform(1.8, 3.2) * depth_scale, 1.0, 6.0)
+            beta_g = np.clip(random.uniform(0.8, 1.8) * depth_scale, 0.5, 3.5)
+            beta_b = np.clip(random.uniform(0.3, 1.0) * depth_scale, 0.2, 2.0)
+
+            # Use actual mean depth as water depth
+            water_depth = mean_depth
+
+            # Haze strength increases with depth (more particles at greater depth)
+            base_haze = random.uniform(0.08, 0.25)
+            haze_strength = np.clip(base_haze + mean_depth * 0.05, 0.08, 0.50)
+        else:
+            # Fallback to heuristic random parameters
+            beta_r = random.uniform(1.8, 3.2)
+            beta_g = random.uniform(0.8, 1.8)
+            beta_b = random.uniform(0.3, 1.0)
+            water_depth = random.uniform(0.4, 1.8)
+            haze_strength = random.uniform(0.08, 0.35)
+
         attenuation = torch.tensor(
             [
                 np.exp(-beta_r * water_depth),
@@ -345,13 +385,20 @@ class ColorImageDataset(Dataset):
             device=img.device,
         ).view(3, 1, 1)
 
-        haze_strength = random.uniform(0.08, 0.35)
         underwater = direct * (1.0 - haze_strength) + veiling_light * haze_strength
 
-        # Slight blur to mimic scattering.
-        if random.random() < 0.7:
+        # Blur strength increases with depth (more scattering at greater depth)
+        if depth is not None:
+            # Use depth-aware blur: deeper images get more blur
+            blur_prob = np.clip(0.7 + (mean_depth - 1.0) * 0.1, 0.6, 0.95)
+            blur_sigma = np.clip(random.uniform(0.1, 1.2) + mean_depth * 0.15, 0.1, 2.0)
+        else:
+            blur_prob = 0.7
+            blur_sigma = random.uniform(0.1, 1.2)
+
+        if random.random() < blur_prob:
             k = random.choice([3, 5])
-            underwater = TF.gaussian_blur(underwater, kernel_size=k, sigma=random.uniform(0.1, 1.2))
+            underwater = TF.gaussian_blur(underwater, kernel_size=k, sigma=blur_sigma)
 
         # Contrast compression and gamma shift.
         contrast = random.uniform(0.75, 0.95)
@@ -380,7 +427,31 @@ class ColorImageDataset(Dataset):
         if self.enable_augmentation and self.split == "train":
             original = self._apply_photometric_augmentation(original)
 
-        underwater = self._simulate_underwater(original)
+        # Try to load precomputed depth if available
+        depth = None
+        if self.depths_root is not None:
+            rel_path = image_path.relative_to(self.data_root)
+            depth_path = self.depths_root / rel_path.with_suffix(".npy")
+            if depth_path.exists():
+                try:
+                    depth_np = np.load(str(depth_path)).astype(np.float32)
+                    # Resize depth to match image resolution if needed
+                    if depth_np.shape != (self.img_size[0], self.img_size[1]):
+                        depth_t = torch.from_numpy(depth_np).unsqueeze(0).unsqueeze(0)
+                        depth_resized = F.interpolate(
+                            depth_t,
+                            size=self.img_size,
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                        depth = depth_resized.squeeze(0).squeeze(0)
+                    else:
+                        depth = torch.from_numpy(depth_np)
+                except Exception as e:
+                    logger.warning(f"Failed to load depth from {depth_path}: {e}")
+                    depth = None
+
+        underwater = self._simulate_underwater(original, depth=depth)
 
         original = self.normalize(original)
         underwater = self.normalize(underwater)
@@ -403,6 +474,7 @@ def build_color_image_dataloader(
     train_ratio: float = 0.98,
     seed: int = 42,
     enable_augmentation: bool = True,
+    depths_root: str | None = None,
 ) -> DataLoader:
     """Convenience factory for paired (original, underwater) RGB dataloader."""
     dataset = ColorImageDataset(
@@ -412,6 +484,7 @@ def build_color_image_dataloader(
         train_ratio=train_ratio,
         seed=seed,
         enable_augmentation=enable_augmentation,
+        depths_root=depths_root,
     )
 
     if shuffle is None:
@@ -934,6 +1007,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_depth",  type=float, default=80.0)
     p.add_argument("--train_ratio", type=float, default=0.98,
                    help="Train/val split ratio for image-only mode.")
+    p.add_argument("--depths_root", default=None,
+                   help="Optional directory with precomputed depth maps (.npy files). "
+                        "Must mirror the directory structure of data_root.")
     p.add_argument("--disable_augmentation", action="store_true",
                    help="Disable data augmentation in image-only mode.")
     p.add_argument("--consistency_grad_weight", type=float, default=0.5)
@@ -1059,6 +1135,7 @@ def main():
             train_ratio=args.train_ratio,
             seed=args.seed,
             enable_augmentation=not args.disable_augmentation,
+            depths_root=args.depths_root,
         )
         val_loader = build_color_image_dataloader(
             data_root=args.data_root,
@@ -1070,6 +1147,7 @@ def main():
             train_ratio=args.train_ratio,
             seed=args.seed,
             enable_augmentation=False,
+            depths_root=args.depths_root,
         )
     else:
         train_dataset = DepthDataset(args.data_root, split="train",
