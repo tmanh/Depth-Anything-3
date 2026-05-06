@@ -38,6 +38,7 @@ from torch.utils.data import DataLoader, Dataset
 from torch.cuda.amp import GradScaler
 from PIL import Image
 import torchvision.transforms as T
+import torchvision.transforms.functional as TF
 
 # PEFT – install with: pip install peft>=0.10.0
 from peft import LoraConfig, TaskType, get_peft_model, PeftModel
@@ -143,11 +144,12 @@ class ColorImageDataset(Dataset):
     Image-only dataset for folders like ../dataset where images are spread across
     nested subdirectories (for example sa_000023/*.jpg, coco2017/*.jpg, ...).
 
-    Returns:
-      {
-        "image":      FloatTensor [3, H, W] normalized,
-        "image_path": str path to source image
-      }
+        Returns:
+            {
+                "original_image":   FloatTensor [3, H, W] normalized,
+                "underwater_image": FloatTensor [3, H, W] normalized,
+                "image_path":       str path to source image
+            }
     """
 
     IMG_MEAN = [0.485, 0.456, 0.406]
@@ -161,10 +163,12 @@ class ColorImageDataset(Dataset):
         img_size: tuple[int, int] = (518, 518),
         train_ratio: float = 0.98,
         seed: int = 42,
+        enable_augmentation: bool = True,
     ):
         self.data_root = Path(data_root)
         self.img_size = img_size
         self.split = split
+        self.enable_augmentation = enable_augmentation
 
         if split not in {"train", "val", "all"}:
             raise ValueError("split must be one of: train, val, all")
@@ -202,11 +206,9 @@ class ColorImageDataset(Dataset):
                 "Adjust train_ratio or use split='all'."
             )
 
-        self.img_transform = T.Compose([
-            T.Resize(img_size, interpolation=T.InterpolationMode.BILINEAR),
-            T.ToTensor(),
-            T.Normalize(mean=self.IMG_MEAN, std=self.IMG_STD),
-        ])
+        self.base_resize = T.Resize(img_size, interpolation=T.InterpolationMode.BILINEAR)
+        self.to_tensor = T.ToTensor()
+        self.normalize = T.Normalize(mean=self.IMG_MEAN, std=self.IMG_STD)
 
         logger.info(
             f"ColorImageDataset split={split}: {len(self.image_paths)} images from {self.data_root}"
@@ -215,12 +217,139 @@ class ColorImageDataset(Dataset):
     def __len__(self) -> int:
         return len(self.image_paths)
 
+    def _apply_geometric_augmentation(self, image: Image.Image) -> Image.Image:
+        """Apply the same geometric augmentation before creating the underwater pair."""
+        # Use a slightly larger crop scale range to improve robustness for scene depth.
+        i, j, h, w = T.RandomResizedCrop.get_params(
+            image,
+            scale=(0.65, 1.0),
+            ratio=(0.9, 1.1),
+        )
+        image = TF.resized_crop(
+            image,
+            i,
+            j,
+            h,
+            w,
+            size=self.img_size,
+            interpolation=T.InterpolationMode.BILINEAR,
+        )
+
+        if random.random() < 0.5:
+            image = TF.hflip(image)
+        if random.random() < 0.15:
+            image = TF.vflip(image)
+
+        if random.random() < 0.25:
+            angle = random.uniform(-8.0, 8.0)
+            image = TF.rotate(
+                image,
+                angle,
+                interpolation=T.InterpolationMode.BILINEAR,
+                fill=0,
+            )
+        return image
+
+    def _apply_photometric_augmentation(self, img: torch.Tensor) -> torch.Tensor:
+        """Standard photometric jitter for the original (clean) branch."""
+        # img: [3, H, W] in [0, 1]
+        brightness = random.uniform(0.85, 1.15)
+        contrast = random.uniform(0.85, 1.15)
+        saturation = random.uniform(0.85, 1.15)
+        hue = random.uniform(-0.03, 0.03)
+
+        out = TF.adjust_brightness(img, brightness)
+        out = TF.adjust_contrast(out, contrast)
+        out = TF.adjust_saturation(out, saturation)
+        out = TF.adjust_hue(out, hue)
+        return out.clamp(0.0, 1.0)
+
+    def _simulate_underwater(self, img: torch.Tensor) -> torch.Tensor:
+        """
+        Underwater simulation from a clean RGB tensor [0, 1].
+
+        Effects included:
+        1) Wavelength-dependent attenuation (red attenuates most)
+        2) Forward scatter / veiling light (blue-green haze)
+        3) Slight blur and sensor noise
+        4) Contrast reduction and mild gamma shift
+        """
+        c, h, w = img.shape
+        if c != 3:
+            raise ValueError("Expected 3-channel RGB tensor.")
+
+        # Random attenuation coefficients (stronger for red channel).
+        beta_r = random.uniform(1.8, 3.2)
+        beta_g = random.uniform(0.8, 1.8)
+        beta_b = random.uniform(0.3, 1.0)
+        # Pseudo-depth scalar controls global water thickness.
+        water_depth = random.uniform(0.4, 1.8)
+        attenuation = torch.tensor(
+            [
+                np.exp(-beta_r * water_depth),
+                np.exp(-beta_g * water_depth),
+                np.exp(-beta_b * water_depth),
+            ],
+            dtype=img.dtype,
+            device=img.device,
+        ).view(3, 1, 1)
+
+        direct = img * attenuation
+
+        # Veiling light color: underwater ambient often cyan/green-blue.
+        veiling_light = torch.tensor(
+            [
+                random.uniform(0.02, 0.10),
+                random.uniform(0.20, 0.42),
+                random.uniform(0.28, 0.55),
+            ],
+            dtype=img.dtype,
+            device=img.device,
+        ).view(3, 1, 1)
+
+        haze_strength = random.uniform(0.08, 0.35)
+        underwater = direct * (1.0 - haze_strength) + veiling_light * haze_strength
+
+        # Slight blur to mimic scattering.
+        if random.random() < 0.7:
+            k = random.choice([3, 5])
+            underwater = TF.gaussian_blur(underwater, kernel_size=k, sigma=random.uniform(0.1, 1.2))
+
+        # Contrast compression and gamma shift.
+        contrast = random.uniform(0.75, 0.95)
+        underwater = TF.adjust_contrast(underwater, contrast)
+        gamma = random.uniform(0.9, 1.2)
+        underwater = TF.adjust_gamma(underwater.clamp(0.0, 1.0), gamma)
+
+        # Mild sensor noise.
+        noise_std = random.uniform(0.0, 0.015)
+        if noise_std > 0:
+            underwater = underwater + torch.randn_like(underwater) * noise_std
+
+        return underwater.clamp(0.0, 1.0)
+
     def __getitem__(self, idx: int) -> dict:
         image_path = self.image_paths[idx]
         image = Image.open(image_path).convert("RGB")
-        img_tensor = self.img_transform(image)
+
+        if self.enable_augmentation and self.split == "train":
+            image = self._apply_geometric_augmentation(image)
+        else:
+            image = self.base_resize(image)
+
+        original = self.to_tensor(image).clamp(0.0, 1.0)
+
+        if self.enable_augmentation and self.split == "train":
+            original = self._apply_photometric_augmentation(original)
+
+        underwater = self._simulate_underwater(original)
+
+        original = self.normalize(original)
+        underwater = self.normalize(underwater)
+
         return {
-            "image": img_tensor,
+            "original_image": original,
+            "underwater_image": underwater,
             "image_path": str(image_path),
         }
 
@@ -234,14 +363,16 @@ def build_color_image_dataloader(
     shuffle: bool | None = None,
     train_ratio: float = 0.98,
     seed: int = 42,
+    enable_augmentation: bool = True,
 ) -> DataLoader:
-    """Convenience factory for an RGB-only dataloader."""
+    """Convenience factory for paired (original, underwater) RGB dataloader."""
     dataset = ColorImageDataset(
         data_root=data_root,
         split=split,
         img_size=img_size,
         train_ratio=train_ratio,
         seed=seed,
+        enable_augmentation=enable_augmentation,
     )
 
     if shuffle is None:
@@ -321,6 +452,49 @@ def depth_loss(
         c = pred_conf[valid_mask].clamp(min=1e-6)
         conf_loss = (torch.abs(torch.log(p) - torch.log(t)) / c + torch.log(c)).mean()
         loss = loss + 0.1 * conf_loss
+
+    return loss
+
+
+def depth_consistency_loss(
+    pred_underwater: torch.Tensor,
+    pred_original_teacher: torch.Tensor,
+    conf_underwater: torch.Tensor | None = None,
+    conf_original_teacher: torch.Tensor | None = None,
+    grad_weight: float = 0.5,
+    conf_weight: float = 0.1,
+) -> torch.Tensor:
+    """
+    Self-distillation loss for underwater adaptation.
+
+    The model prediction on clean/original image acts as teacher target,
+    and the underwater branch is optimized to match it.
+    """
+    teacher = pred_original_teacher.detach().clamp(min=1e-3)
+    student = pred_underwater.clamp(min=1e-3)
+
+    valid = torch.isfinite(teacher) & torch.isfinite(student) & (teacher > 1e-3)
+    if not valid.any():
+        return torch.tensor(0.0, device=pred_underwater.device)
+
+    log_diff = torch.abs(torch.log(student[valid]) - torch.log(teacher[valid])).mean()
+
+    grad = gradient_loss(
+        student,
+        teacher,
+        torch.ones_like(student, dtype=torch.bool),
+    )
+    loss = log_diff + grad_weight * grad
+
+    if conf_underwater is not None:
+        conf_s = conf_underwater.clamp(min=1e-6)
+        if conf_original_teacher is not None:
+            conf_t = conf_original_teacher.detach().clamp(min=1e-6)
+            conf_target = conf_t
+        else:
+            conf_target = torch.ones_like(conf_s)
+        conf_l1 = torch.abs(conf_s[valid] - conf_target[valid]).mean()
+        loss = loss + conf_weight * conf_l1
 
     return loss
 
@@ -484,6 +658,83 @@ def train_one_epoch(
     return total_loss / len(loader)
 
 
+def train_one_epoch_underwater(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
+    device: torch.device,
+    epoch: int,
+    grad_clip: float = 1.0,
+    consistency_grad_weight: float = 0.5,
+    consistency_conf_weight: float = 0.1,
+) -> float:
+    model.train()
+    total_loss = 0.0
+
+    for step, batch in enumerate(loader):
+        original = batch["original_image"].to(device)
+        underwater = batch["underwater_image"].to(device)
+
+        original_5d = original.unsqueeze(1)
+        underwater_5d = underwater.unsqueeze(1)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.no_grad():
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+                teacher_out = model.model(original_5d)
+                teacher_depth = teacher_out["depth"][:, 0]
+                teacher_conf = teacher_out.get("depth_conf", None)
+                if teacher_conf is not None:
+                    teacher_conf = teacher_conf[:, 0]
+
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+            student_out = model.model(underwater_5d)
+            student_depth = student_out["depth"][:, 0]
+            student_conf = student_out.get("depth_conf", None)
+            if student_conf is not None:
+                student_conf = student_conf[:, 0]
+
+            if student_depth.shape[-2:] != teacher_depth.shape[-2:]:
+                student_depth = F.interpolate(
+                    student_depth.unsqueeze(1),
+                    size=teacher_depth.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(1)
+                if student_conf is not None:
+                    student_conf = F.interpolate(
+                        student_conf.unsqueeze(1),
+                        size=teacher_depth.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(1)
+
+            loss = depth_consistency_loss(
+                pred_underwater=student_depth,
+                pred_original_teacher=teacher_depth,
+                conf_underwater=student_conf,
+                conf_original_teacher=teacher_conf,
+                grad_weight=consistency_grad_weight,
+                conf_weight=consistency_conf_weight,
+            )
+
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+
+        total_loss += loss.item()
+        if step % 50 == 0:
+            logger.info(
+                f"Epoch {epoch} | step {step}/{len(loader)} | consistency_loss {loss.item():.4f}"
+            )
+
+    return total_loss / max(1, len(loader))
+
+
 @torch.no_grad()
 def validate(
     model: nn.Module,
@@ -524,6 +775,68 @@ def validate(
     }
 
 
+@torch.no_grad()
+def validate_underwater(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    consistency_grad_weight: float = 0.5,
+    consistency_conf_weight: float = 0.1,
+) -> dict[str, float]:
+    model.eval()
+    total_consistency = 0.0
+    count = 0
+
+    for batch in loader:
+        original = batch["original_image"].to(device)
+        underwater = batch["underwater_image"].to(device)
+
+        original_5d = original.unsqueeze(1)
+        underwater_5d = underwater.unsqueeze(1)
+
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+            teacher_out = model.model(original_5d)
+            student_out = model.model(underwater_5d)
+
+        teacher_depth = teacher_out["depth"][:, 0]
+        teacher_conf = teacher_out.get("depth_conf", None)
+        if teacher_conf is not None:
+            teacher_conf = teacher_conf[:, 0]
+
+        student_depth = student_out["depth"][:, 0]
+        student_conf = student_out.get("depth_conf", None)
+        if student_conf is not None:
+            student_conf = student_conf[:, 0]
+
+        if student_depth.shape[-2:] != teacher_depth.shape[-2:]:
+            student_depth = F.interpolate(
+                student_depth.unsqueeze(1),
+                size=teacher_depth.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(1)
+            if student_conf is not None:
+                student_conf = F.interpolate(
+                    student_conf.unsqueeze(1),
+                    size=teacher_depth.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(1)
+
+        loss = depth_consistency_loss(
+            pred_underwater=student_depth,
+            pred_original_teacher=teacher_depth,
+            conf_underwater=student_conf,
+            conf_original_teacher=teacher_conf,
+            grad_weight=consistency_grad_weight,
+            conf_weight=consistency_conf_weight,
+        )
+        total_consistency += loss.item()
+        count += 1
+
+    return {"consistency": total_consistency / max(1, count)}
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -550,9 +863,21 @@ def parse_args() -> argparse.Namespace:
 
     # Data
     p.add_argument("--data_root",  required=True, help="Root directory of the dataset.")
+    p.add_argument(
+        "--training_mode",
+        default="supervised",
+        choices=["supervised", "underwater_consistency"],
+        help="supervised: use RGB+depth labels, underwater_consistency: image-only self-distillation.",
+    )
     p.add_argument("--img_height", type=int, default=518)
     p.add_argument("--img_width",  type=int, default=518)
     p.add_argument("--max_depth",  type=float, default=80.0)
+    p.add_argument("--train_ratio", type=float, default=0.98,
+                   help="Train/val split ratio for image-only mode.")
+    p.add_argument("--disable_augmentation", action="store_true",
+                   help="Disable data augmentation in image-only mode.")
+    p.add_argument("--consistency_grad_weight", type=float, default=0.5)
+    p.add_argument("--consistency_conf_weight", type=float, default=0.1)
 
     # Training
     p.add_argument("--epochs",     type=int,   default=20)
@@ -627,26 +952,48 @@ def main():
     # 3. Data
     # ------------------------------------------------------------------
     img_size = (args.img_height, args.img_width)
-    train_dataset = DepthDataset(args.data_root, split="train",
-                                  img_size=img_size, max_depth=args.max_depth)
-    val_dataset   = DepthDataset(args.data_root, split="val",
-                                  img_size=img_size, max_depth=args.max_depth)
+    if args.training_mode == "underwater_consistency":
+        train_loader = build_color_image_dataloader(
+            data_root=args.data_root,
+            split="train",
+            img_size=img_size,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            train_ratio=args.train_ratio,
+            seed=args.seed,
+            enable_augmentation=not args.disable_augmentation,
+        )
+        val_loader = build_color_image_dataloader(
+            data_root=args.data_root,
+            split="val",
+            img_size=img_size,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            train_ratio=args.train_ratio,
+            seed=args.seed,
+            enable_augmentation=False,
+        )
+    else:
+        train_dataset = DepthDataset(args.data_root, split="train",
+                                      img_size=img_size, max_depth=args.max_depth)
+        val_dataset   = DepthDataset(args.data_root, split="val",
+                                      img_size=img_size, max_depth=args.max_depth)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-    )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
 
     # ------------------------------------------------------------------
     # 4. Optimiser + scheduler
@@ -681,27 +1028,55 @@ def main():
     # ------------------------------------------------------------------
     # 5. Training
     # ------------------------------------------------------------------
-    best_abs_rel = float("inf")
+    best_score = float("inf")
     global_step  = 0
 
     for epoch in range(1, args.epochs + 1):
         logger.info(f"=== Epoch {epoch}/{args.epochs} ===")
 
-        train_loss = train_one_epoch(
-            model, train_loader, optimizer, scaler, device, epoch, args.grad_clip
-        )
+        if args.training_mode == "underwater_consistency":
+            train_loss = train_one_epoch_underwater(
+                model,
+                train_loader,
+                optimizer,
+                scaler,
+                device,
+                epoch,
+                args.grad_clip,
+                args.consistency_grad_weight,
+                args.consistency_conf_weight,
+            )
+        else:
+            train_loss = train_one_epoch(
+                model, train_loader, optimizer, scaler, device, epoch, args.grad_clip
+            )
         scheduler.step(global_step + len(train_loader))
         global_step += len(train_loader)
 
-        metrics = validate(model, val_loader, device)
-        logger.info(
-            f"Epoch {epoch} | train_loss={train_loss:.4f} | "
-            f"abs_rel={metrics['abs_rel']:.4f} | delta1={metrics['delta1']:.4f}"
-        )
+        if args.training_mode == "underwater_consistency":
+            metrics = validate_underwater(
+                model,
+                val_loader,
+                device,
+                args.consistency_grad_weight,
+                args.consistency_conf_weight,
+            )
+            logger.info(
+                f"Epoch {epoch} | train_loss={train_loss:.4f} | "
+                f"val_consistency={metrics['consistency']:.4f}"
+            )
+            current_score = metrics["consistency"]
+        else:
+            metrics = validate(model, val_loader, device)
+            logger.info(
+                f"Epoch {epoch} | train_loss={train_loss:.4f} | "
+                f"abs_rel={metrics['abs_rel']:.4f} | delta1={metrics['delta1']:.4f}"
+            )
+            current_score = metrics["abs_rel"]
 
         # Save best
-        if metrics["abs_rel"] < best_abs_rel:
-            best_abs_rel = metrics["abs_rel"]
+        if current_score < best_score:
+            best_score = current_score
             save_path = output_dir / "best_lora"
             _save_checkpoint(model, optimizer, scaler, epoch, metrics, save_path, args)
             logger.info(f"  → new best saved to {save_path}")
