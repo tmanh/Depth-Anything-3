@@ -676,8 +676,7 @@ def train_one_epoch_underwater(
     for step, batch in enumerate(loader):
         original = batch["original_image"].to(device)
         underwater = batch["underwater_image"].to(device)
-        print(original.shape, underwater.shape)
-        exit()
+
         original_5d = original.unsqueeze(1)
         underwater_5d = underwater.unsqueeze(1)
 
