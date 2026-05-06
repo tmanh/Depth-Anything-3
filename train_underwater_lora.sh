@@ -16,7 +16,7 @@ set -euo pipefail
 DATA_ROOT="${DATA_ROOT:-../dataset}"
 OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints_underwater}"
 MODEL_NAME="${MODEL_NAME:-da3-large}"
-PRETRAINED_PATH="${PRETRAINED_PATH:-ByteDance-Seed/Depth-Anything-3}"
+PRETRAINED_PATH="${PRETRAINED_PATH:-depth-anything/DA3NESTED-GIANT-LARGE-1.1}"
 
 EPOCHS="${EPOCHS:-20}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
@@ -50,6 +50,34 @@ if [[ ! -d "$DATA_ROOT" ]]; then
 fi
 
 mkdir -p "$OUTPUT_DIR"
+
+# Resolve a valid default Hugging Face checkpoint unless user overrides PRETRAINED_PATH.
+# Public DA3 checkpoints live under depth-anything/*, not ByteDance-Seed/*.
+if [[ -z "$PRETRAINED_PATH" ]]; then
+  case "$MODEL_NAME" in
+    da3-large)
+      PRETRAINED_PATH="depth-anything/DA3-LARGE-1.1"
+      ;;
+    da3-giant)
+      PRETRAINED_PATH="depth-anything/DA3-GIANT-1.1"
+      ;;
+    da3-base)
+      PRETRAINED_PATH="depth-anything/DA3-BASE"
+      ;;
+    da3-small)
+      PRETRAINED_PATH="depth-anything/DA3-SMALL"
+      ;;
+    da3metric-large)
+      PRETRAINED_PATH="depth-anything/DA3-LARGE-1.1"
+      ;;
+    da3mono-large)
+      PRETRAINED_PATH="depth-anything/DA3-LARGE-1.1"
+      ;;
+    *)
+      PRETRAINED_PATH="depth-anything/DA3-LARGE-1.1"
+      ;;
+  esac
+fi
 
 # -----------------------------
 # Launch training

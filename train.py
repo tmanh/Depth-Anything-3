@@ -574,8 +574,9 @@ def build_lora_model(
         # rank-stabilised LoRA (rsLoRA): divides scale by sqrt(r) instead of r
         use_rslora=True,
         target_modules=target_modules,
-        # task_type is not strictly required for custom models but keeps PEFT happy
-        task_type=TaskType.FEATURE_EXTRACTION,
+        # Keep task_type unset for custom vision models so PEFT does not inject
+        # NLP-specific kwargs (e.g., input_ids) into forward().
+        task_type=None,
         # Init LoRA B to zero so the adapter starts as an identity transform
         init_lora_weights="gaussian",
     )
@@ -675,7 +676,8 @@ def train_one_epoch_underwater(
     for step, batch in enumerate(loader):
         original = batch["original_image"].to(device)
         underwater = batch["underwater_image"].to(device)
-
+        print(original.shape, underwater.shape)
+        exit()
         original_5d = original.unsqueeze(1)
         underwater_5d = underwater.unsqueeze(1)
 
