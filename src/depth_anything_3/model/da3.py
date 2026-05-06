@@ -407,9 +407,9 @@ class NestedDepthAnything3Net(nn.Module):
         valid_metric_depth = metric_output.depth[align_mask]
         scale_factor = least_squares_scale_scalar(valid_metric_depth, valid_depth)
 
-        # Apply scaling to depth and extrinsics
-        output.depth *= scale_factor
-        output.extrinsics[:, :, :3, 3] *= scale_factor
+        # Avoid in-place writes on tensors that still participate in autograd.
+        output.depth = output.depth * scale_factor
+        output.extrinsics[:, :, :3, 3] = output.extrinsics[:, :, :3, 3] * scale_factor
         output.is_metric = 1
         output.scale_factor = scale_factor.item()
 

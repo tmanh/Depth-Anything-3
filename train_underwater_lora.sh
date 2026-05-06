@@ -19,17 +19,20 @@ MODEL_NAME="${MODEL_NAME:-da3-large}"
 PRETRAINED_PATH="${PRETRAINED_PATH:-depth-anything/DA3NESTED-GIANT-LARGE-1.1}"
 
 EPOCHS="${EPOCHS:-20}"
-BATCH_SIZE="${BATCH_SIZE:-4}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-4}"
 LR="${LR:-1e-4}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 SEED="${SEED:-42}"
+USE_DORA="${USE_DORA:-0}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 
 LORA_RANK="${LORA_RANK:-16}"
 LORA_ALPHA="${LORA_ALPHA:-32}"
 LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
 
-IMG_HEIGHT="${IMG_HEIGHT:-518}"
-IMG_WIDTH="${IMG_WIDTH:-518}"
+IMG_HEIGHT="${IMG_HEIGHT:-490}"
+IMG_WIDTH="${IMG_WIDTH:-490}"
 TRAIN_RATIO="${TRAIN_RATIO:-0.98}"
 
 CONSISTENCY_GRAD_WEIGHT="${CONSISTENCY_GRAD_WEIGHT:-0.5}"
@@ -87,9 +90,16 @@ echo "  DATA_ROOT=$DATA_ROOT"
 echo "  OUTPUT_DIR=$OUTPUT_DIR"
 echo "  MODEL_NAME=$MODEL_NAME"
 echo "  PRETRAINED_PATH=$PRETRAINED_PATH"
-echo "  EPOCHS=$EPOCHS BATCH_SIZE=$BATCH_SIZE LR=$LR"
+echo "  EPOCHS=$EPOCHS BATCH_SIZE=$BATCH_SIZE GRAD_ACCUM_STEPS=$GRAD_ACCUM_STEPS LR=$LR"
+echo "  NPROC_PER_NODE=$NPROC_PER_NODE"
 
-torchrun --standalone --nproc_per_node=1 train.py \
+TORCH_ARGS=()
+if [[ "$USE_DORA" == "1" ]]; then
+  TORCH_ARGS+=(--use_dora)
+fi
+
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
+torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" train.py \
   --training_mode underwater_consistency \
   --data_root "$DATA_ROOT" \
   --output_dir "$OUTPUT_DIR" \
@@ -97,16 +107,17 @@ torchrun --standalone --nproc_per_node=1 train.py \
   --pretrained_path "$PRETRAINED_PATH" \
   --epochs "$EPOCHS" \
   --batch_size "$BATCH_SIZE" \
+  --grad_accum_steps "$GRAD_ACCUM_STEPS" \
   --lr "$LR" \
   --num_workers "$NUM_WORKERS" \
   --seed "$SEED" \
   --lora_rank "$LORA_RANK" \
   --lora_alpha "$LORA_ALPHA" \
   --lora_dropout "$LORA_DROPOUT" \
-  --use_dora \
   --img_height "$IMG_HEIGHT" \
   --img_width "$IMG_WIDTH" \
   --train_ratio "$TRAIN_RATIO" \
   --consistency_grad_weight "$CONSISTENCY_GRAD_WEIGHT" \
   --consistency_conf_weight "$CONSISTENCY_CONF_WEIGHT" \
+  "${TORCH_ARGS[@]}" \
   "$@"

@@ -32,9 +32,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 from torch.cuda.amp import GradScaler
 from PIL import Image
 import torchvision.transforms as T
@@ -47,6 +50,41 @@ from peft.tuners.lora import LoraLayer
 from depth_anything_3.api import DepthAnything3
 from depth_anything_3.cfg import load_config
 from depth_anything_3.utils.logger import logger
+
+
+def is_distributed() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_rank() -> int:
+    return dist.get_rank() if is_distributed() else 0
+
+
+def is_main_process() -> bool:
+    return get_rank() == 0
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    return model.module if isinstance(model, DDP) else model
+
+
+def reduce_scalar_mean(value: float, device: torch.device) -> float:
+    if not is_distributed():
+        return value
+    tensor = torch.tensor(value, dtype=torch.float32, device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    tensor = tensor / dist.get_world_size()
+    return float(tensor.item())
+
+
+def setup_distributed() -> tuple[bool, int, int]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size > 1:
+        dist.init_process_group(backend="nccl", init_method="env://")
+        torch.cuda.set_device(local_rank)
+        return True, local_rank, world_size
+    return False, local_rank, world_size
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +399,7 @@ def build_color_image_dataloader(
     batch_size: int = 4,
     num_workers: int = 4,
     shuffle: bool | None = None,
+    sampler: torch.utils.data.Sampler | None = None,
     train_ratio: float = 0.98,
     seed: int = 42,
     enable_augmentation: bool = True,
@@ -377,11 +416,14 @@ def build_color_image_dataloader(
 
     if shuffle is None:
         shuffle = split == "train"
+    if sampler is not None:
+        shuffle = False
 
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=False,
@@ -600,9 +642,12 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     grad_clip: float = 1.0,
+    grad_accum_steps: int = 1,
 ) -> float:
     model.train()
     total_loss = 0.0
+    optimizer.zero_grad(set_to_none=True)
+    core_model = unwrap_model(model).model
 
     for step, batch in enumerate(loader):
         images     = batch["image"].to(device)        # (B, 3, H, W)
@@ -612,10 +657,8 @@ def train_one_epoch(
         # DA3 expects (B, N, 3, H, W) – single-frame mode: N=1
         images_5d = images.unsqueeze(1)
 
-        optimizer.zero_grad(set_to_none=True)
-
         with torch.autocast(device_type=device.type, dtype=torch.float16):
-            output = model.model(images_5d)
+            output = core_model(images_5d)
 
             # output["depth"]: (B, N, H, W)  →  take view 0
             pred_depth = output["depth"][:, 0]         # (B, H, W)
@@ -641,19 +684,25 @@ def train_one_epoch(
 
             loss = depth_loss(pred_depth, pred_conf, depth_gt, valid_mask)
 
+        raw_loss = loss.detach()
+        loss = loss / grad_accum_steps
         scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(
-            [p for p in model.parameters() if p.requires_grad], grad_clip
-        )
-        scaler.step(optimizer)
-        scaler.update()
 
-        total_loss += loss.item()
+        should_step = ((step + 1) % grad_accum_steps == 0) or ((step + 1) == len(loader))
+        if should_step:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad], grad_clip
+            )
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        total_loss += raw_loss.item()
 
         if step % 50 == 0:
             logger.info(
-                f"Epoch {epoch} | step {step}/{len(loader)} | loss {loss.item():.4f}"
+                f"Epoch {epoch} | step {step}/{len(loader)} | loss {raw_loss.item():.4f}"
             )
 
     return total_loss / len(loader)
@@ -669,9 +718,12 @@ def train_one_epoch_underwater(
     grad_clip: float = 1.0,
     consistency_grad_weight: float = 0.5,
     consistency_conf_weight: float = 0.1,
+    grad_accum_steps: int = 1,
 ) -> float:
     model.train()
     total_loss = 0.0
+    optimizer.zero_grad(set_to_none=True)
+    core_model = unwrap_model(model).model
 
     for step, batch in enumerate(loader):
         original = batch["original_image"].to(device)
@@ -680,18 +732,17 @@ def train_one_epoch_underwater(
         original_5d = original.unsqueeze(1)
         underwater_5d = underwater.unsqueeze(1)
 
-        optimizer.zero_grad(set_to_none=True)
-
         with torch.no_grad():
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-                teacher_out = model.model(original_5d)
+                teacher_out = core_model(original_5d)
                 teacher_depth = teacher_out["depth"][:, 0]
                 teacher_conf = teacher_out.get("depth_conf", None)
                 if teacher_conf is not None:
                     teacher_conf = teacher_conf[:, 0]
+                del teacher_out
 
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-            student_out = model.model(underwater_5d)
+            student_out = core_model(underwater_5d)
             student_depth = student_out["depth"][:, 0]
             student_conf = student_out.get("depth_conf", None)
             if student_conf is not None:
@@ -721,16 +772,22 @@ def train_one_epoch_underwater(
                 conf_weight=consistency_conf_weight,
             )
 
+        raw_loss = loss.detach()
+        loss = loss / grad_accum_steps
         scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
 
-        total_loss += loss.item()
+        should_step = ((step + 1) % grad_accum_steps == 0) or ((step + 1) == len(loader))
+        if should_step:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        total_loss += raw_loss.item()
         if step % 50 == 0:
             logger.info(
-                f"Epoch {epoch} | step {step}/{len(loader)} | consistency_loss {loss.item():.4f}"
+                f"Epoch {epoch} | step {step}/{len(loader)} | consistency_loss {raw_loss.item():.4f}"
             )
 
     return total_loss / max(1, len(loader))
@@ -743,6 +800,7 @@ def validate(
     device: torch.device,
 ) -> dict[str, float]:
     model.eval()
+    core_model = unwrap_model(model).model
     abs_rel_sum = 0.0
     delta1_sum  = 0.0
     count       = 0
@@ -753,7 +811,7 @@ def validate(
         valid_mask = batch["valid_mask"].to(device)
 
         with torch.autocast(device_type=device.type, dtype=torch.float16):
-            output = model.model(images)
+            output = core_model(images)
 
         pred = output["depth"][:, 0]
         if pred.shape[-2:] != depth_gt.shape[-2:]:
@@ -785,6 +843,7 @@ def validate_underwater(
     consistency_conf_weight: float = 0.1,
 ) -> dict[str, float]:
     model.eval()
+    core_model = unwrap_model(model).model
     total_consistency = 0.0
     count = 0
 
@@ -796,8 +855,8 @@ def validate_underwater(
         underwater_5d = underwater.unsqueeze(1)
 
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-            teacher_out = model.model(original_5d)
-            student_out = model.model(underwater_5d)
+            teacher_out = core_model(original_5d)
+            student_out = core_model(underwater_5d)
 
         teacher_depth = teacher_out["depth"][:, 0]
         teacher_conf = teacher_out.get("depth_conf", None)
@@ -883,6 +942,8 @@ def parse_args() -> argparse.Namespace:
     # Training
     p.add_argument("--epochs",     type=int,   default=20)
     p.add_argument("--batch_size", type=int,   default=4)
+    p.add_argument("--grad_accum_steps", type=int, default=1,
+                   help="Number of gradient accumulation steps.")
     p.add_argument("--lr",         type=float, default=1e-4)
     p.add_argument("--wd",         type=float, default=1e-2,  help="Weight decay.")
     p.add_argument("--grad_clip",  type=float, default=1.0)
@@ -901,10 +962,16 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
-    set_seed(args.seed)
+    distributed, local_rank, world_size = setup_distributed()
+    set_seed(args.seed + get_rank())
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{local_rank}" if distributed else "cuda")
+    else:
+        device = torch.device("cpu")
+
+    if is_main_process():
+        logger.info(f"Using device: {device} | distributed={distributed} world_size={world_size}")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -913,10 +980,12 @@ def main():
     # 1. Load base model
     # ------------------------------------------------------------------
     if args.pretrained_path:
-        logger.info(f"Loading pretrained weights from: {args.pretrained_path}")
+        if is_main_process():
+            logger.info(f"Loading pretrained weights from: {args.pretrained_path}")
         model = DepthAnything3.from_pretrained(args.pretrained_path)
     else:
-        logger.info(f"Initialising model from config: {args.model_name}")
+        if is_main_process():
+            logger.info(f"Initialising model from config: {args.model_name}")
         model = DepthAnything3(model_name=args.model_name)
 
     model = model.to(device)
@@ -925,7 +994,8 @@ def main():
     # 2. Apply LoRA (or resume adapter)
     # ------------------------------------------------------------------
     if args.resume:
-        logger.info(f"Resuming LoRA adapter from: {args.resume}")
+        if is_main_process():
+            logger.info(f"Resuming LoRA adapter from: {args.resume}")
         model.model = PeftModel.from_pretrained(model.model, args.resume, is_trainable=True)
     else:
         model = build_lora_model(
@@ -943,23 +1013,49 @@ def main():
                 if "head" in name or "cam_dec" in name or "cam_enc" in name:
                     param.requires_grad_(False)
 
+    if distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+
     # Count trainable parameters
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total     = sum(p.numel() for p in model.parameters())
-    logger.info(f"Trainable params: {trainable:,} / {total:,} "
-                f"({100 * trainable / total:.2f}%)")
+    if is_main_process():
+        logger.info(f"Trainable params: {trainable:,} / {total:,} "
+                    f"({100 * trainable / total:.2f}%)")
 
     # ------------------------------------------------------------------
     # 3. Data
     # ------------------------------------------------------------------
     img_size = (args.img_height, args.img_width)
+    train_sampler = None
+    val_sampler = None
     if args.training_mode == "underwater_consistency":
+        train_dataset = ColorImageDataset(
+            data_root=args.data_root,
+            split="train",
+            img_size=img_size,
+            train_ratio=args.train_ratio,
+            seed=args.seed,
+            enable_augmentation=not args.disable_augmentation,
+        )
+        val_dataset = ColorImageDataset(
+            data_root=args.data_root,
+            split="val",
+            img_size=img_size,
+            train_ratio=args.train_ratio,
+            seed=args.seed,
+            enable_augmentation=False,
+        )
+        if distributed:
+            train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False)
+            val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False)
         train_loader = build_color_image_dataloader(
             data_root=args.data_root,
             split="train",
             img_size=img_size,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
+            sampler=train_sampler,
             train_ratio=args.train_ratio,
             seed=args.seed,
             enable_augmentation=not args.disable_augmentation,
@@ -970,6 +1066,7 @@ def main():
             img_size=img_size,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
+            sampler=val_sampler,
             train_ratio=args.train_ratio,
             seed=args.seed,
             enable_augmentation=False,
@@ -980,10 +1077,15 @@ def main():
         val_dataset   = DepthDataset(args.data_root, split="val",
                                       img_size=img_size, max_depth=args.max_depth)
 
+        if distributed:
+            train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True)
+            val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False)
+
         train_loader = DataLoader(
             train_dataset,
             batch_size=args.batch_size,
-            shuffle=True,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
             num_workers=args.num_workers,
             pin_memory=True,
             drop_last=True,
@@ -992,6 +1094,7 @@ def main():
             val_dataset,
             batch_size=args.batch_size,
             shuffle=False,
+            sampler=val_sampler,
             num_workers=args.num_workers,
             pin_memory=True,
         )
@@ -1033,7 +1136,13 @@ def main():
     global_step  = 0
 
     for epoch in range(1, args.epochs + 1):
-        logger.info(f"=== Epoch {epoch}/{args.epochs} ===")
+        if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
+            train_sampler.set_epoch(epoch)
+        if val_sampler is not None and hasattr(val_sampler, "set_epoch"):
+            val_sampler.set_epoch(epoch)
+
+        if is_main_process():
+            logger.info(f"=== Epoch {epoch}/{args.epochs} ===")
 
         if args.training_mode == "underwater_consistency":
             train_loss = train_one_epoch_underwater(
@@ -1046,11 +1155,13 @@ def main():
                 args.grad_clip,
                 args.consistency_grad_weight,
                 args.consistency_conf_weight,
+                args.grad_accum_steps,
             )
         else:
             train_loss = train_one_epoch(
-                model, train_loader, optimizer, scaler, device, epoch, args.grad_clip
+                model, train_loader, optimizer, scaler, device, epoch, args.grad_clip, args.grad_accum_steps
             )
+        train_loss = reduce_scalar_mean(train_loss, device)
         scheduler.step(global_step + len(train_loader))
         global_step += len(train_loader)
 
@@ -1062,32 +1173,42 @@ def main():
                 args.consistency_grad_weight,
                 args.consistency_conf_weight,
             )
-            logger.info(
-                f"Epoch {epoch} | train_loss={train_loss:.4f} | "
-                f"val_consistency={metrics['consistency']:.4f}"
-            )
+            metrics["consistency"] = reduce_scalar_mean(metrics["consistency"], device)
+            if is_main_process():
+                logger.info(
+                    f"Epoch {epoch} | train_loss={train_loss:.4f} | "
+                    f"val_consistency={metrics['consistency']:.4f}"
+                )
             current_score = metrics["consistency"]
         else:
             metrics = validate(model, val_loader, device)
-            logger.info(
-                f"Epoch {epoch} | train_loss={train_loss:.4f} | "
-                f"abs_rel={metrics['abs_rel']:.4f} | delta1={metrics['delta1']:.4f}"
-            )
+            metrics["abs_rel"] = reduce_scalar_mean(metrics["abs_rel"], device)
+            metrics["delta1"] = reduce_scalar_mean(metrics["delta1"], device)
+            if is_main_process():
+                logger.info(
+                    f"Epoch {epoch} | train_loss={train_loss:.4f} | "
+                    f"abs_rel={metrics['abs_rel']:.4f} | delta1={metrics['delta1']:.4f}"
+                )
             current_score = metrics["abs_rel"]
 
         # Save best
-        if current_score < best_score:
+        if is_main_process() and current_score < best_score:
             best_score = current_score
             save_path = output_dir / "best_lora"
             _save_checkpoint(model, optimizer, scaler, epoch, metrics, save_path, args)
             logger.info(f"  → new best saved to {save_path}")
 
         # Periodic checkpoint
-        if epoch % args.save_every == 0:
+        if is_main_process() and epoch % args.save_every == 0:
             save_path = output_dir / f"epoch_{epoch:04d}"
             _save_checkpoint(model, optimizer, scaler, epoch, metrics, save_path, args)
 
-    logger.info("Training complete.")
+    if is_main_process():
+        logger.info("Training complete.")
+
+    if is_distributed():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def _save_checkpoint(
@@ -1102,9 +1223,11 @@ def _save_checkpoint(
     """Save LoRA adapter weights + training state."""
     save_path.mkdir(parents=True, exist_ok=True)
 
+    model_unwrapped = unwrap_model(model)
+
     # Save only the LoRA adapter (tiny – no full model weights)
-    if hasattr(model.model, "save_pretrained"):
-        model.model.save_pretrained(str(save_path / "lora_adapter"))
+    if hasattr(model_unwrapped.model, "save_pretrained"):
+        model_unwrapped.model.save_pretrained(str(save_path / "lora_adapter"))
 
     # Save training state for resumption
     torch.save(
