@@ -308,106 +308,154 @@ class ColorImageDataset(Dataset):
         self, img: torch.Tensor, depth: torch.Tensor | None = None
     ) -> torch.Tensor:
         """
-        Underwater simulation from a clean RGB tensor [0, 1].
+        Physically based underwater/turbidity simulation.
 
-        Effects include:
-        1) Wavelength-dependent attenuation (red attenuates most)
-        2) Forward scatter / veiling light (blue-green haze)
-        3) Slight blur and sensor noise
-        4) Contrast reduction and mild gamma shift
+        Model:
+            I(x) = J(x) * T(x) + A * (1 - T(x))
 
-        If depth is provided, uses it to drive physically plausible parameters:
-        - Attenuation coefficients scale with mean depth
-        - Haze strength increases with depth
-        - Blur correlates with depth
-        Otherwise, uses random heuristic parameters.
+        where:
+            T(x) = exp(-c * d(x))
+
+        c is the beam attenuation coefficient caused by water + suspended particles.
+        Higher turbidity means larger scattering/attenuation coefficients.
 
         Args:
-            img: RGB image tensor [0, 1] of shape (3, H, W)
-            depth: Optional depth map (H, W) in meters. If None, uses random parameters.
+            img: RGB image tensor in [0, 1], shape (3, H, W)
+            depth: Optional depth map, shape (H, W)
         """
         c, h, w = img.shape
         if c != 3:
             raise ValueError("Expected 3-channel RGB tensor.")
 
-        # If depth is provided, use it to drive the simulation parameters
+        device = img.device
+        dtype = img.dtype
+
+        # --------------------------------------------------
+        # 1. Build depth map d(x)
+        # --------------------------------------------------
         if depth is not None:
-            depth_np = depth.cpu().numpy() if isinstance(depth, torch.Tensor) else depth
-            # Compute mean and variance of depth (clamp to avoid NaN)
-            depth_valid = depth_np[depth_np > 0.1]
-            if depth_valid.size > 0:
-                mean_depth = float(np.mean(depth_valid))
-                # Clamp mean depth for stability
-                mean_depth = np.clip(mean_depth, 0.1, 10.0)
+            if isinstance(depth, torch.Tensor):
+                d = depth.to(device=device, dtype=dtype)
             else:
-                mean_depth = 1.0
+                d = torch.from_numpy(depth).to(device=device, dtype=dtype)
 
-            # Scale attenuation coefficients with depth (deeper = more attenuation)
-            depth_scale = np.clip(mean_depth / 5.0, 0.5, 2.0)  # normalize to ~1.0 at 5m
-            beta_r = np.clip(random.uniform(1.8, 3.2) * depth_scale, 1.0, 6.0)
-            beta_g = np.clip(random.uniform(0.8, 1.8) * depth_scale, 0.5, 3.5)
-            beta_b = np.clip(random.uniform(0.3, 1.0) * depth_scale, 0.2, 2.0)
+            # Replace invalid values
+            valid = torch.isfinite(d) & (d > 0)
 
-            # Use actual mean depth as water depth
-            water_depth = mean_depth
+            if valid.any():
+                d_min = torch.quantile(d[valid], 0.01)
+                d_max = torch.quantile(d[valid], 0.99)
 
-            # Haze strength increases with depth (more particles at greater depth)
-            base_haze = random.uniform(0.08, 0.25)
-            haze_strength = np.clip(base_haze + mean_depth * 0.05, 0.08, 0.50)
+                d = torch.clamp(d, d_min, d_max)
+                d = d / d_max
+            else:
+                d = torch.ones((h, w), dtype=dtype, device=device) * 0.5
+
+            # Convert normalized depth to an effective water path length.
+            # Keep this moderate to avoid black images.
+            max_range = random.uniform(1.0, 4.0)
+            d = 0.2 + d * max_range
+
         else:
-            # Fallback to heuristic random parameters
-            beta_r = random.uniform(1.8, 3.2)
-            beta_g = random.uniform(0.8, 1.8)
-            beta_b = random.uniform(0.3, 1.0)
-            water_depth = random.uniform(0.4, 1.8)
-            haze_strength = random.uniform(0.08, 0.35)
+            # If no depth is available, use a smooth synthetic depth field.
+            yy = torch.linspace(0, 1, h, device=device, dtype=dtype).view(h, 1)
+            xx = torch.linspace(0, 1, w, device=device, dtype=dtype).view(1, w)
 
-        attenuation = torch.tensor(
+            # Farther toward the top or center depending on random scene layout
+            if random.random() < 0.5:
+                d = 0.5 + 2.5 * yy
+            else:
+                center_x = random.uniform(0.3, 0.7)
+                center_y = random.uniform(0.3, 0.7)
+                d = torch.sqrt((xx - center_x) ** 2 + (yy - center_y) ** 2)
+                d = 0.5 + 3.0 * d / (d.max() + 1e-6)
+
+        d = d.clamp(0.1, 5.0)
+
+        # --------------------------------------------------
+        # 2. Physical coefficients
+        # --------------------------------------------------
+        # These are deliberately moderate.
+        # Larger values create very dark/over-hazed images.
+        #
+        # Red is usually attenuated more strongly than green/blue.
+        absorption = torch.tensor(
             [
-                np.exp(-beta_r * water_depth),
-                np.exp(-beta_g * water_depth),
-                np.exp(-beta_b * water_depth),
+                random.uniform(0.10, 0.35),  # red absorption
+                random.uniform(0.04, 0.16),  # green absorption
+                random.uniform(0.02, 0.10),  # blue absorption
             ],
-            dtype=img.dtype,
-            device=img.device,
+            dtype=dtype,
+            device=device,
         ).view(3, 1, 1)
 
-        direct = img * attenuation
+        # Suspended-particle scattering coefficient.
+        # This is the main turbidity parameter.
+        scattering_strength = random.uniform(0.03, 0.22)
 
-        # Veiling light color: underwater ambient often cyan/green-blue.
-        veiling_light = torch.tensor(
+        scattering = torch.tensor(
             [
-                random.uniform(0.02, 0.10),
-                random.uniform(0.20, 0.42),
-                random.uniform(0.28, 0.55),
+                scattering_strength * random.uniform(0.8, 1.2),
+                scattering_strength * random.uniform(0.9, 1.3),
+                scattering_strength * random.uniform(1.0, 1.5),
             ],
-            dtype=img.dtype,
-            device=img.device,
+            dtype=dtype,
+            device=device,
         ).view(3, 1, 1)
 
-        underwater = direct * (1.0 - haze_strength) + veiling_light * haze_strength
+        beam_attenuation = absorption + scattering
 
-        # Blur strength increases with depth (more scattering at greater depth)
-        if depth is not None:
-            # Use depth-aware blur: deeper images get more blur
-            blur_prob = np.clip(0.7 + (mean_depth - 1.0) * 0.1, 0.6, 0.95)
-            blur_sigma = np.clip(random.uniform(0.1, 1.2) + mean_depth * 0.15, 0.1, 2.0)
-        else:
-            blur_prob = 0.7
-            blur_sigma = random.uniform(0.1, 1.2)
+        # --------------------------------------------------
+        # 3. Transmission map T(x)
+        # --------------------------------------------------
+        transmission = torch.exp(-beam_attenuation * d.view(1, h, w))
 
-        if random.random() < blur_prob:
-            k = random.choice([3, 5])
-            underwater = TF.gaussian_blur(underwater, kernel_size=k, sigma=blur_sigma)
+        # Prevent total collapse to black.
+        transmission = transmission.clamp(0.25, 1.0)
 
-        # Contrast compression and gamma shift.
-        contrast = random.uniform(0.75, 0.95)
-        underwater = TF.adjust_contrast(underwater, contrast)
-        gamma = random.uniform(0.9, 1.2)
-        underwater = TF.adjust_gamma(underwater.clamp(0.0, 1.0), gamma)
+        # --------------------------------------------------
+        # 4. Water-light / in-scattered ambient light
+        # --------------------------------------------------
+        water_light = torch.tensor(
+            [
+                random.uniform(0.03, 0.12),
+                random.uniform(0.12, 0.32),
+                random.uniform(0.16, 0.42),
+            ],
+            dtype=dtype,
+            device=device,
+        ).view(3, 1, 1)
 
-        # Mild sensor noise.
-        noise_std = random.uniform(0.0, 0.015)
+        direct = img * transmission
+        inscatter = water_light * (1.0 - transmission)
+
+        underwater = direct + inscatter
+
+        # --------------------------------------------------
+        # 5. Forward scattering: depth-dependent blur
+        # --------------------------------------------------
+        # Forward scattering reduces sharpness, but should be mild.
+        if random.random() < 0.6:
+            blurred = TF.gaussian_blur(
+                underwater,
+                kernel_size=3,
+                sigma=random.uniform(0.3, 1.0),
+            )
+
+            # More blur where transmission is lower.
+            blur_weight = (1.0 - transmission.mean(dim=0, keepdim=True)).clamp(0.0, 0.4)
+            underwater = underwater * (1.0 - blur_weight) + blurred * blur_weight
+
+        # --------------------------------------------------
+        # 6. Mild contrast loss
+        # --------------------------------------------------
+        contrast = random.uniform(0.88, 1.00)
+        underwater = TF.adjust_contrast(underwater.clamp(0.0, 1.0), contrast)
+
+        # --------------------------------------------------
+        # 7. Mild camera noise
+        # --------------------------------------------------
+        noise_std = random.uniform(0.0, 0.006)
         if noise_std > 0:
             underwater = underwater + torch.randn_like(underwater) * noise_std
 
@@ -455,6 +503,43 @@ class ColorImageDataset(Dataset):
 
         original = self.normalize(original)
         underwater = self.normalize(underwater)
+
+        # --------------------------------------------------
+        # DEBUG: save original and simulated underwater images
+        # --------------------------------------------------
+        if True:
+            from torchvision.utils import save_image
+            from pathlib import Path
+
+            debug_dir = Path(getattr(self, "debug_save_dir", "debug_underwater_samples"))
+            debug_dir.mkdir(parents=True, exist_ok=True)
+
+            stem = image_path.stem
+
+            save_image(
+                original.clamp(0.0, 1.0),
+                debug_dir / f"{idx:06d}_{stem}_original.png",
+            )
+
+            save_image(
+                underwater.clamp(0.0, 1.0),
+                debug_dir / f"{idx:06d}_{stem}_underwater.png",
+            )
+
+            # Optional side-by-side comparison
+            comparison = torch.cat(
+                [
+                    original.clamp(0.0, 1.0),
+                    underwater.clamp(0.0, 1.0),
+                ],
+                dim=2,  # concatenate along width
+            )
+
+            save_image(
+                comparison,
+                debug_dir / f"{idx:06d}_{stem}_comparison.png",
+            )
+        # --------------------------------------------------
 
         return {
             "original_image": original,

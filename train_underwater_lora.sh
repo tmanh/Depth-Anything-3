@@ -19,6 +19,7 @@ set -euo pipefail
 # Defaults (can be overridden by env vars)
 # -----------------------------
 DATA_ROOT="${DATA_ROOT:-../dataset}"
+DEPTHS_ROOT="${DEPTHS_ROOT:-../dataset_depths}"
 OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints_underwater}"
 MODEL_NAME="${MODEL_NAME:-da3-large}"
 PRETRAINED_PATH="${PRETRAINED_PATH:-depth-anything/DA3NESTED-GIANT-LARGE-1.1}"
