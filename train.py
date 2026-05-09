@@ -731,8 +731,11 @@ def depth_consistency_loss(
     pred_original_teacher: torch.Tensor,
     conf_underwater: torch.Tensor | None = None,
     conf_original_teacher: torch.Tensor | None = None,
+    aux_underwater: dict | None = None,
+    aux_original_teacher: dict | None = None,
     grad_weight: float = 0.5,
     conf_weight: float = 0.1,
+    feature_weight: float = 0.0,
 ) -> torch.Tensor:
     """
     Self-distillation loss for underwater adaptation.
@@ -766,7 +769,58 @@ def depth_consistency_loss(
         conf_l1 = torch.abs(conf_s[valid] - conf_target[valid]).mean()
         loss = loss + conf_weight * conf_l1
 
+    if (
+        feature_weight > 0.0
+        and aux_underwater is not None
+        and aux_original_teacher is not None
+    ):
+        feature_terms = []
+        common_keys = sorted(set(aux_underwater.keys()) & set(aux_original_teacher.keys()))
+        for key in common_keys:
+            if not key.startswith("feat_layer_"):
+                continue
+
+            student_feat = aux_underwater[key]
+            teacher_feat = aux_original_teacher[key].detach()
+
+            # Expected shape from DA3 aux export: [B, N, H, W, C]
+            if student_feat.ndim != 5 or teacher_feat.ndim != 5:
+                continue
+
+            s = student_feat.float()
+            t = teacher_feat.float()
+
+            if s.shape[:4] != t.shape[:4]:
+                b, n, hs, ws, c = s.shape
+                bt, nt, ht, wt, ct = t.shape
+                if b != bt or n != nt or c != ct:
+                    continue
+                t_4d = t.permute(0, 1, 4, 2, 3).reshape(b * n, c, ht, wt)
+                t_4d = F.interpolate(t_4d, size=(hs, ws), mode="bilinear", align_corners=False)
+                t = t_4d.reshape(b, n, c, hs, ws).permute(0, 1, 3, 4, 2)
+
+            s_n = F.normalize(s, dim=-1)
+            t_n = F.normalize(t, dim=-1)
+            cosine_term = (1.0 - (s_n * t_n).sum(dim=-1)).mean()
+            l1_term = F.smooth_l1_loss(s, t)
+            feature_terms.append(cosine_term + 0.1 * l1_term)
+
+        if feature_terms:
+            feature_loss = torch.stack(feature_terms).mean()
+            loss = loss + feature_weight * feature_loss
+
     return loss
+
+
+def parse_feature_layers(feature_layers: str) -> list[int]:
+    """Parse comma-separated layer indices for DA3 auxiliary feature export."""
+    layers = []
+    for token in feature_layers.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        layers.append(int(token))
+    return layers
 
 
 # ---------------------------------------------------------------------------
@@ -946,12 +1000,15 @@ def train_one_epoch_underwater(
     grad_clip: float = 1.0,
     consistency_grad_weight: float = 0.5,
     consistency_conf_weight: float = 0.1,
+    feature_consistency_weight: float = 0.0,
+    feature_layers: list[int] | None = None,
     grad_accum_steps: int = 1,
 ) -> float:
     model.train()
     total_loss = 0.0
     optimizer.zero_grad(set_to_none=True)
     core_model = unwrap_model(model).model
+    feature_layers = feature_layers or []
 
     for step, batch in enumerate(loader):
         original = batch["original_image"].to(device)
@@ -962,17 +1019,18 @@ def train_one_epoch_underwater(
 
         with torch.no_grad():
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-                teacher_out = core_model(original_5d)
+                teacher_out = core_model(original_5d, export_feat_layers=feature_layers)
                 teacher_depth = teacher_out["depth"][:, 0]
                 teacher_conf = teacher_out.get("depth_conf", None)
+                teacher_aux = teacher_out.get("aux", None)
                 if teacher_conf is not None:
                     teacher_conf = teacher_conf[:, 0]
-                del teacher_out
 
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-            student_out = core_model(underwater_5d)
+            student_out = core_model(underwater_5d, export_feat_layers=feature_layers)
             student_depth = student_out["depth"][:, 0]
             student_conf = student_out.get("depth_conf", None)
+            student_aux = student_out.get("aux", None)
             if student_conf is not None:
                 student_conf = student_conf[:, 0]
 
@@ -996,8 +1054,11 @@ def train_one_epoch_underwater(
                 pred_original_teacher=teacher_depth,
                 conf_underwater=student_conf,
                 conf_original_teacher=teacher_conf,
+                aux_underwater=student_aux,
+                aux_original_teacher=teacher_aux,
                 grad_weight=consistency_grad_weight,
                 conf_weight=consistency_conf_weight,
+                feature_weight=feature_consistency_weight,
             )
 
         raw_loss = loss.detach()
@@ -1069,11 +1130,14 @@ def validate_underwater(
     device: torch.device,
     consistency_grad_weight: float = 0.5,
     consistency_conf_weight: float = 0.1,
+    feature_consistency_weight: float = 0.0,
+    feature_layers: list[int] | None = None,
 ) -> dict[str, float]:
     model.eval()
     core_model = unwrap_model(model).model
     total_consistency = 0.0
     count = 0
+    feature_layers = feature_layers or []
 
     for batch in loader:
         original = batch["original_image"].to(device)
@@ -1083,16 +1147,18 @@ def validate_underwater(
         underwater_5d = underwater.unsqueeze(1)
 
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-            teacher_out = core_model(original_5d)
-            student_out = core_model(underwater_5d)
+            teacher_out = core_model(original_5d, export_feat_layers=feature_layers)
+            student_out = core_model(underwater_5d, export_feat_layers=feature_layers)
 
         teacher_depth = teacher_out["depth"][:, 0]
         teacher_conf = teacher_out.get("depth_conf", None)
+        teacher_aux = teacher_out.get("aux", None)
         if teacher_conf is not None:
             teacher_conf = teacher_conf[:, 0]
 
         student_depth = student_out["depth"][:, 0]
         student_conf = student_out.get("depth_conf", None)
+        student_aux = student_out.get("aux", None)
         if student_conf is not None:
             student_conf = student_conf[:, 0]
 
@@ -1116,8 +1182,11 @@ def validate_underwater(
             pred_original_teacher=teacher_depth,
             conf_underwater=student_conf,
             conf_original_teacher=teacher_conf,
+            aux_underwater=student_aux,
+            aux_original_teacher=teacher_aux,
             grad_weight=consistency_grad_weight,
             conf_weight=consistency_conf_weight,
+            feature_weight=feature_consistency_weight,
         )
         total_consistency += loss.item()
         count += 1
@@ -1169,6 +1238,10 @@ def parse_args() -> argparse.Namespace:
                    help="Disable data augmentation in image-only mode.")
     p.add_argument("--consistency_grad_weight", type=float, default=0.5)
     p.add_argument("--consistency_conf_weight", type=float, default=0.1)
+    p.add_argument("--feature_consistency_weight", type=float, default=0.05,
+                   help="Weight for feature-level consistency against teacher model.")
+    p.add_argument("--feature_layers", type=str, default="11",
+                   help="Comma-separated backbone layer indices exported for feature matching.")
 
     # Training
     p.add_argument("--epochs",     type=int,   default=20)
@@ -1193,6 +1266,7 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
+    feature_layers = parse_feature_layers(args.feature_layers)
     distributed, local_rank, world_size = setup_distributed()
     set_seed(args.seed + get_rank())
 
@@ -1388,6 +1462,8 @@ def main():
                 args.grad_clip,
                 args.consistency_grad_weight,
                 args.consistency_conf_weight,
+                args.feature_consistency_weight,
+                feature_layers,
                 args.grad_accum_steps,
             )
         else:
@@ -1405,6 +1481,8 @@ def main():
                 device,
                 args.consistency_grad_weight,
                 args.consistency_conf_weight,
+                args.feature_consistency_weight,
+                feature_layers,
             )
             metrics["consistency"] = reduce_scalar_mean(metrics["consistency"], device)
             if is_main_process():
