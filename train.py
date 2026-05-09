@@ -1351,10 +1351,29 @@ def main():
     # ------------------------------------------------------------------
     # 2. Apply LoRA (or resume adapter)
     # ------------------------------------------------------------------
+    resume_state: dict | None = None
     if args.resume:
+        resume_dir = Path(args.resume)
+        lora_dir = resume_dir / "lora_adapter"
+        state_file = resume_dir / "training_state.pt"
+
         if is_main_process():
-            logger.info(f"Resuming LoRA adapter from: {args.resume}")
-        model.model = PeftModel.from_pretrained(model.model, args.resume, is_trainable=True)
+            logger.info(f"Resuming LoRA adapter from: {lora_dir}")
+        model.model = PeftModel.from_pretrained(
+            model.model, str(lora_dir) if lora_dir.exists() else args.resume, is_trainable=True
+        )
+
+        if state_file.exists():
+            resume_state = torch.load(str(state_file), map_location="cpu")
+            if is_main_process():
+                logger.info(
+                    f"Loaded training state: epoch={resume_state.get('epoch', 0)}, "
+                    f"global_step={resume_state.get('global_step', 0)}, "
+                    f"images_seen={resume_state.get('global_images_seen', 0)}"
+                )
+        else:
+            if is_main_process():
+                logger.warning(f"No training_state.pt found at {resume_dir}, resuming weights only.")
     else:
         model = build_lora_model(
             model,
@@ -1490,14 +1509,32 @@ def main():
     scaler    = GradScaler()
 
     # ------------------------------------------------------------------
-    # 5. Training
+    # 5. Restore optimiser / scaler / counters if resuming
     # ------------------------------------------------------------------
+    start_epoch = 1
     best_score = float("inf")
-    global_step  = 0
+    global_step = 0
     global_images_seen = 0
+
+    if resume_state is not None:
+        optimizer.load_state_dict(resume_state["optimizer"])
+        scaler.load_state_dict(resume_state["scaler"])
+        start_epoch = resume_state.get("epoch", 0) + 1
+        global_step = resume_state.get("global_step", 0)
+        global_images_seen = resume_state.get("global_images_seen", 0)
+        best_score = resume_state.get("best_score", float("inf"))
+        # Fast-forward LR scheduler to the correct position
+        for _ in range(global_step):
+            scheduler.step()
+        if is_main_process():
+            logger.info(
+                f"Resuming training from epoch {start_epoch} "
+                f"(global_step={global_step}, images_seen={global_images_seen})"
+            )
+
     training_start_time = time.time()
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         epoch_start_time = time.time()
         if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)
@@ -1512,6 +1549,9 @@ def main():
             if is_main_process():
                 save_path = output_dir / f"imgs_{images_seen:010d}"
                 logger.info(f"  → image checkpoint at {images_seen} images → {save_path}")
+                _save_checkpoint._global_step = global_step
+                _save_checkpoint._global_images_seen = images_seen
+                _save_checkpoint._best_score = best_score
                 _save_checkpoint(model, optimizer, scaler, _epoch, {}, save_path, args)
 
         _ckpt_fn = _image_checkpoint_fn if args.save_every_n_images > 0 else None
@@ -1590,12 +1630,18 @@ def main():
         if is_main_process() and current_score < best_score:
             best_score = current_score
             save_path = output_dir / "best_lora"
+            _save_checkpoint._global_step = global_step
+            _save_checkpoint._global_images_seen = global_images_seen
+            _save_checkpoint._best_score = best_score
             _save_checkpoint(model, optimizer, scaler, epoch, metrics, save_path, args)
             logger.info(f"  → new best saved to {save_path}")
 
         # Per-epoch checkpoint (every save_every epochs; default=1 means every epoch)
         if is_main_process() and epoch % args.save_every == 0:
             save_path = output_dir / f"epoch_{epoch:04d}"
+            _save_checkpoint._global_step = global_step
+            _save_checkpoint._global_images_seen = global_images_seen
+            _save_checkpoint._best_score = best_score
             _save_checkpoint(model, optimizer, scaler, epoch, metrics, save_path, args)
             logger.info(f"  → epoch checkpoint saved to {save_path}")
 
@@ -1628,11 +1674,14 @@ def _save_checkpoint(
     # Save training state for resumption
     torch.save(
         {
-            "epoch":     epoch,
-            "metrics":   metrics,
-            "optimizer": optimizer.state_dict(),
-            "scaler":    scaler.state_dict(),
-            "args":      vars(args),
+            "epoch":              epoch,
+            "metrics":            metrics,
+            "optimizer":          optimizer.state_dict(),
+            "scaler":             scaler.state_dict(),
+            "args":               vars(args),
+            "global_step":        getattr(_save_checkpoint, "_global_step", 0),
+            "global_images_seen": getattr(_save_checkpoint, "_global_images_seen", 0),
+            "best_score":         getattr(_save_checkpoint, "_best_score", float("inf")),
         },
         save_path / "training_state.pt",
     )
