@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -96,6 +97,17 @@ def set_seed(seed: int = 42):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def format_eta(seconds: float) -> str:
+    """Format seconds as HH:MM:SS for readable ETA logging."""
+    if not np.isfinite(seconds) or seconds < 0:
+        return "unknown"
+    total = int(round(seconds))
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
 # ---------------------------------------------------------------------------
@@ -925,11 +937,15 @@ def train_one_epoch(
     epoch: int,
     grad_clip: float = 1.0,
     grad_accum_steps: int = 1,
+    save_every_n_images: int = 0,
+    images_seen_offset: int = 0,
+    checkpoint_fn=None,
 ) -> float:
     model.train()
     total_loss = 0.0
     optimizer.zero_grad(set_to_none=True)
     core_model = unwrap_model(model).model
+    epoch_start_time = time.time()
 
     for step, batch in enumerate(loader):
         images     = batch["image"].to(device)        # (B, 3, H, W)
@@ -982,9 +998,24 @@ def train_one_epoch(
 
         total_loss += raw_loss.item()
 
+        # Mid-epoch image-count checkpoint
+        if checkpoint_fn is not None and save_every_n_images > 0:
+            local_bs = images.shape[0]
+            ws = dist.get_world_size() if is_distributed() else 1
+            prev_seen = images_seen_offset + step * local_bs * ws
+            curr_seen = images_seen_offset + (step + 1) * local_bs * ws
+            if curr_seen // save_every_n_images != prev_seen // save_every_n_images:
+                checkpoint_fn(curr_seen)
+
         if step % 50 == 0:
+            elapsed = time.time() - epoch_start_time
+            done_steps = step + 1
+            sec_per_step = elapsed / max(done_steps, 1)
+            remaining_steps = max(0, len(loader) - done_steps)
+            eta_epoch = sec_per_step * remaining_steps
             logger.info(
-                f"Epoch {epoch} | step {step}/{len(loader)} | loss {raw_loss.item():.4f}"
+                f"Epoch {epoch} | step {step}/{len(loader)} | loss {raw_loss.item():.4f} "
+                f"| step_time={sec_per_step:.3f}s | eta_epoch={format_eta(eta_epoch)}"
             )
 
     return total_loss / len(loader)
@@ -1003,12 +1034,16 @@ def train_one_epoch_underwater(
     feature_consistency_weight: float = 0.0,
     feature_layers: list[int] | None = None,
     grad_accum_steps: int = 1,
+    save_every_n_images: int = 0,
+    images_seen_offset: int = 0,
+    checkpoint_fn=None,
 ) -> float:
     model.train()
     total_loss = 0.0
     optimizer.zero_grad(set_to_none=True)
     core_model = unwrap_model(model).model
     feature_layers = feature_layers or []
+    epoch_start_time = time.time()
 
     for step, batch in enumerate(loader):
         original = batch["original_image"].to(device)
@@ -1074,9 +1109,25 @@ def train_one_epoch_underwater(
             optimizer.zero_grad(set_to_none=True)
 
         total_loss += raw_loss.item()
+
+        # Mid-epoch image-count checkpoint
+        if checkpoint_fn is not None and save_every_n_images > 0:
+            local_bs = original.shape[0]
+            ws = dist.get_world_size() if is_distributed() else 1
+            prev_seen = images_seen_offset + step * local_bs * ws
+            curr_seen = images_seen_offset + (step + 1) * local_bs * ws
+            if curr_seen // save_every_n_images != prev_seen // save_every_n_images:
+                checkpoint_fn(curr_seen)
+
         if step % 50 == 0:
+            elapsed = time.time() - epoch_start_time
+            done_steps = step + 1
+            sec_per_step = elapsed / max(done_steps, 1)
+            remaining_steps = max(0, len(loader) - done_steps)
+            eta_epoch = sec_per_step * remaining_steps
             logger.info(
-                f"Epoch {epoch} | step {step}/{len(loader)} | consistency_loss {raw_loss.item():.4f}"
+                f"Epoch {epoch} | step {step}/{len(loader)} | consistency_loss {raw_loss.item():.4f} "
+                f"| step_time={sec_per_step:.3f}s | eta_epoch={format_eta(eta_epoch)}"
             )
 
     return total_loss / max(1, len(loader))
@@ -1256,8 +1307,10 @@ def parse_args() -> argparse.Namespace:
 
     # I/O
     p.add_argument("--output_dir", default="./checkpoints")
-    p.add_argument("--save_every", type=int, default=5,
-                   help="Save checkpoint every N epochs.")
+    p.add_argument("--save_every", type=int, default=1,
+                   help="Save checkpoint every N epochs (1 = every epoch).")
+    p.add_argument("--save_every_n_images", type=int, default=10000,
+                   help="Also save a mid-epoch checkpoint every N training images seen (0 to disable).")
     p.add_argument("--resume",     default=None, help="Path to LoRA checkpoint to resume from.")
     p.add_argument("--seed",       type=int, default=42)
 
@@ -1441,8 +1494,11 @@ def main():
     # ------------------------------------------------------------------
     best_score = float("inf")
     global_step  = 0
+    global_images_seen = 0
+    training_start_time = time.time()
 
     for epoch in range(1, args.epochs + 1):
+        epoch_start_time = time.time()
         if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)
         if val_sampler is not None and hasattr(val_sampler, "set_epoch"):
@@ -1450,6 +1506,15 @@ def main():
 
         if is_main_process():
             logger.info(f"=== Epoch {epoch}/{args.epochs} ===")
+
+        # Mid-epoch image-count checkpoint callback (main process only)
+        def _image_checkpoint_fn(images_seen: int, _epoch: int = epoch) -> None:
+            if is_main_process():
+                save_path = output_dir / f"imgs_{images_seen:010d}"
+                logger.info(f"  → image checkpoint at {images_seen} images → {save_path}")
+                _save_checkpoint(model, optimizer, scaler, _epoch, {}, save_path, args)
+
+        _ckpt_fn = _image_checkpoint_fn if args.save_every_n_images > 0 else None
 
         if args.training_mode == "underwater_consistency":
             train_loss = train_one_epoch_underwater(
@@ -1465,14 +1530,22 @@ def main():
                 args.feature_consistency_weight,
                 feature_layers,
                 args.grad_accum_steps,
+                args.save_every_n_images,
+                global_images_seen,
+                _ckpt_fn,
             )
         else:
             train_loss = train_one_epoch(
-                model, train_loader, optimizer, scaler, device, epoch, args.grad_clip, args.grad_accum_steps
+                model, train_loader, optimizer, scaler, device, epoch, args.grad_clip,
+                args.grad_accum_steps,
+                args.save_every_n_images,
+                global_images_seen,
+                _ckpt_fn,
             )
         train_loss = reduce_scalar_mean(train_loss, device)
         scheduler.step(global_step + len(train_loader))
         global_step += len(train_loader)
+        global_images_seen += len(train_loader) * args.batch_size * world_size
 
         if args.training_mode == "underwater_consistency":
             metrics = validate_underwater(
@@ -1502,6 +1575,17 @@ def main():
                 )
             current_score = metrics["abs_rel"]
 
+        if is_main_process():
+            epoch_elapsed = time.time() - epoch_start_time
+            training_elapsed = time.time() - training_start_time
+            avg_epoch_time = training_elapsed / epoch
+            remaining_epochs = max(0, args.epochs - epoch)
+            eta_total = avg_epoch_time * remaining_epochs
+            logger.info(
+                f"Epoch {epoch} finished in {format_eta(epoch_elapsed)} | "
+                f"eta_total={format_eta(eta_total)}"
+            )
+
         # Save best
         if is_main_process() and current_score < best_score:
             best_score = current_score
@@ -1509,10 +1593,11 @@ def main():
             _save_checkpoint(model, optimizer, scaler, epoch, metrics, save_path, args)
             logger.info(f"  → new best saved to {save_path}")
 
-        # Periodic checkpoint
+        # Per-epoch checkpoint (every save_every epochs; default=1 means every epoch)
         if is_main_process() and epoch % args.save_every == 0:
             save_path = output_dir / f"epoch_{epoch:04d}"
             _save_checkpoint(model, optimizer, scaler, epoch, metrics, save_path, args)
+            logger.info(f"  → epoch checkpoint saved to {save_path}")
 
     if is_main_process():
         logger.info("Training complete.")
