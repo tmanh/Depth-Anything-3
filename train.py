@@ -290,18 +290,101 @@ class ColorImageDataset(Dataset):
             )
         return image
 
+    def _load_precomputed_depth(self, image_path: Path) -> torch.Tensor | None:
+        """Load precomputed depth corresponding to image_path if available."""
+        if self.depths_root is None:
+            return None
+
+        rel_path = image_path.relative_to(self.data_root)
+        depth_path = self.depths_root / rel_path.with_suffix(".npy")
+        if not depth_path.exists():
+            return None
+
+        try:
+            depth_np = np.load(str(depth_path)).astype(np.float32)
+            return torch.from_numpy(depth_np)
+        except Exception as e:
+            logger.warning(f"Failed to load depth from {depth_path}: {e}")
+            return None
+
+    def _apply_geometric_augmentation_pair(
+        self,
+        image: Image.Image,
+        depth: torch.Tensor | None,
+    ) -> tuple[Image.Image, torch.Tensor | None]:
+        """Apply identical geometric transforms to image and optional depth map."""
+        
+        # First, ensure depth matches image dimensions before getting crop params
+        if depth is not None:
+            img_h, img_w = image.size[::-1]  # PIL Image.size is (W, H)
+            if depth.shape != (img_h, img_w):
+                # Resize depth to match image dimensions
+                depth_t = depth.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+                depth = F.interpolate(
+                    depth_t,
+                    size=(img_h, img_w),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0).squeeze(0)
+
+        i, j, h, w = T.RandomResizedCrop.get_params(
+            image,
+            scale=(0.65, 1.0),
+            ratio=(0.9, 1.1),
+        )
+        image = TF.resized_crop(
+            image,
+            i,
+            j,
+            h,
+            w,
+            size=self.img_size,
+            interpolation=T.InterpolationMode.BILINEAR,
+        )
+        if depth is not None:
+            depth = TF.resized_crop(
+                depth.unsqueeze(0),
+                i,
+                j,
+                h,
+                w,
+                size=self.img_size,
+                interpolation=T.InterpolationMode.BILINEAR,
+            ).squeeze(0)
+
+        if random.random() < 0.5:
+            image = TF.hflip(image)
+            if depth is not None:
+                depth = TF.hflip(depth.unsqueeze(0)).squeeze(0)
+        if random.random() < 0.15:
+            image = TF.vflip(image)
+            if depth is not None:
+                depth = TF.vflip(depth.unsqueeze(0)).squeeze(0)
+
+        if random.random() < 0.25:
+            angle = random.uniform(-8.0, 8.0)
+            image = TF.rotate(
+                image,
+                angle,
+                interpolation=T.InterpolationMode.BILINEAR,
+                fill=0,
+            )
+            if depth is not None:
+                depth = TF.rotate(
+                    depth.unsqueeze(0),
+                    angle,
+                    interpolation=T.InterpolationMode.BILINEAR,
+                    fill=0,
+                ).squeeze(0)
+
+        return image, depth
+
     def _apply_photometric_augmentation(self, img: torch.Tensor) -> torch.Tensor:
         """Standard photometric jitter for the original (clean) branch."""
         # img: [3, H, W] in [0, 1]
-        brightness = random.uniform(0.85, 1.15)
-        contrast = random.uniform(0.85, 1.15)
-        saturation = random.uniform(0.85, 1.15)
-        hue = random.uniform(-0.03, 0.03)
+        hue = random.uniform(-0.01, 0.01)
 
-        out = TF.adjust_brightness(img, brightness)
-        out = TF.adjust_contrast(out, contrast)
-        out = TF.adjust_saturation(out, saturation)
-        out = TF.adjust_hue(out, hue)
+        out = TF.adjust_hue(img, hue)
         return out.clamp(0.0, 1.0)
 
     def _simulate_underwater(
@@ -465,39 +548,26 @@ class ColorImageDataset(Dataset):
         image_path = self.image_paths[idx]
         image = Image.open(image_path).convert("RGB")
 
+        # Load depth first so geometric augmentation can be applied consistently.
+        depth = self._load_precomputed_depth(image_path)
+
         if self.enable_augmentation and self.split == "train":
-            image = self._apply_geometric_augmentation(image)
+            image, depth = self._apply_geometric_augmentation_pair(image, depth)
         else:
             image = self.base_resize(image)
+            if depth is not None and depth.shape != (self.img_size[0], self.img_size[1]):
+                depth_t = depth.unsqueeze(0).unsqueeze(0)
+                depth = F.interpolate(
+                    depth_t,
+                    size=self.img_size,
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0).squeeze(0)
 
         original = self.to_tensor(image).clamp(0.0, 1.0)
 
         if self.enable_augmentation and self.split == "train":
             original = self._apply_photometric_augmentation(original)
-
-        # Try to load precomputed depth if available
-        depth = None
-        if self.depths_root is not None:
-            rel_path = image_path.relative_to(self.data_root)
-            depth_path = self.depths_root / rel_path.with_suffix(".npy")
-            if depth_path.exists():
-                try:
-                    depth_np = np.load(str(depth_path)).astype(np.float32)
-                    # Resize depth to match image resolution if needed
-                    if depth_np.shape != (self.img_size[0], self.img_size[1]):
-                        depth_t = torch.from_numpy(depth_np).unsqueeze(0).unsqueeze(0)
-                        depth_resized = F.interpolate(
-                            depth_t,
-                            size=self.img_size,
-                            mode="bilinear",
-                            align_corners=False,
-                        )
-                        depth = depth_resized.squeeze(0).squeeze(0)
-                    else:
-                        depth = torch.from_numpy(depth_np)
-                except Exception as e:
-                    logger.warning(f"Failed to load depth from {depth_path}: {e}")
-                    depth = None
 
         underwater = self._simulate_underwater(original, depth=depth)
 
