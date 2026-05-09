@@ -4,9 +4,14 @@ set -euo pipefail
 # Train Depth Anything 3 with LoRA for underwater domain adaptation
 # using image-only consistency training (original vs simulated underwater).
 #
+# For depth-aware underwater simulation:
+#   1. Preprocess: python preprocess_depth.py --data_root ../dataset --output_dir ../dataset_depths
+#   2. Train with:  DEPTHS_ROOT=../dataset_depths bash train_underwater_lora.sh
+#
 # Examples:
 #   bash train_underwater_lora.sh
 #   bash train_underwater_lora.sh --data_root ../dataset --epochs 30 --batch_size 8
+#   DEPTHS_ROOT=../dataset_depths bash train_underwater_lora.sh  # Use depth-aware simulation
 #
 # Any extra CLI args are forwarded to train.py.
 
@@ -37,6 +42,9 @@ TRAIN_RATIO="${TRAIN_RATIO:-0.98}"
 
 CONSISTENCY_GRAD_WEIGHT="${CONSISTENCY_GRAD_WEIGHT:-0.5}"
 CONSISTENCY_CONF_WEIGHT="${CONSISTENCY_CONF_WEIGHT:-0.1}"
+
+# Optional: Path to precomputed depth maps (for depth-aware underwater simulation)
+DEPTHS_ROOT="${DEPTHS_ROOT:-}"
 
 # -----------------------------
 # Basic checks
@@ -89,8 +97,7 @@ echo "Starting underwater LoRA training"
 echo "  DATA_ROOT=$DATA_ROOT"
 echo "  OUTPUT_DIR=$OUTPUT_DIR"
 echo "  MODEL_NAME=$MODEL_NAME"
-echo "  PRETRAINED_PATH=$PRETRAINED_PATH"
-echo "  EPOCHS=$EPOCHS BATCH_SIZE=$BATCH_SIZE GRAD_ACCUM_STEPS=$GRAD_ACCUM_STEPS LR=$LR"
+echo "  PRETRAINED_PATH=$PRETRAINED_PATH"echo "  DEPTHS_ROOT=${DEPTHS_ROOT:-none (heuristic simulation)}"echo "  EPOCHS=$EPOCHS BATCH_SIZE=$BATCH_SIZE GRAD_ACCUM_STEPS=$GRAD_ACCUM_STEPS LR=$LR"
 echo "  NPROC_PER_NODE=$NPROC_PER_NODE"
 
 TORCH_ARGS=()
@@ -119,5 +126,6 @@ torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" train.py \
   --train_ratio "$TRAIN_RATIO" \
   --consistency_grad_weight "$CONSISTENCY_GRAD_WEIGHT" \
   --consistency_conf_weight "$CONSISTENCY_CONF_WEIGHT" \
+  $([ -n "$DEPTHS_ROOT" ] && echo "--depths_root $DEPTHS_ROOT") \
   "${TORCH_ARGS[@]}" \
   "$@"

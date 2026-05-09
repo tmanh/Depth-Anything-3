@@ -21,6 +21,19 @@ LORA_RANK=16
 LORA_ALPHA=32
 EPOCHS=20
 
+ask_yes_no() {
+    local prompt="$1"
+    local reply
+    while true; do
+        read -r -p "$prompt (y/n) " reply
+        case "${reply,,}" in
+            y|yes) return 0 ;;
+            n|no) return 1 ;;
+            *) echo "Please answer y or n." ;;
+        esac
+    done
+}
+
 echo "==================================================================="
 echo "Step 1: Preprocess - Compute depth maps for all dataset images"
 echo "==================================================================="
@@ -38,11 +51,10 @@ echo "    --model_name da3-large \\"
 echo "    --pretrained_path $PRETRAINED_PATH \\"
 echo "    --batch_size 8 \\"
 echo "    --img_height 518 \\"
-echo "    --img_width 518"
+echo "    --img_width 518 \\" 
+echo "    --skip_existing"
 echo ""
-read -p "Run preprocessing? (y/n) " -n 1 -r
-echo ""
-if [[ $REPLY =~ ^[Yy]$ ]]; then
+if ask_yes_no "Run preprocessing?"; then
     python preprocess_depth.py \
         --data_root "$DATASET_ROOT" \
         --output_dir "$DEPTHS_ROOT" \
@@ -50,7 +62,8 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
         --pretrained_path "$PRETRAINED_PATH" \
         --batch_size 8 \
         --img_height 518 \
-        --img_width 518
+        --img_width 518 \
+        --skip_existing
 fi
 
 echo ""
@@ -78,9 +91,7 @@ echo "    --img_height $IMG_HEIGHT \\"
 echo "    --img_width $IMG_WIDTH \\"
 echo "    --epochs $EPOCHS"
 echo ""
-read -p "Run training? (y/n) " -n 1 -r
-echo ""
-if [[ $REPLY =~ ^[Yy]$ ]]; then
+if ask_yes_no "Run training?"; then
     mkdir -p "$OUTPUT_DIR"
     export CUDA_VISIBLE_DEVICES=0,1
     export TORCH_CUDA_ARCH_LIST="89"
@@ -99,9 +110,11 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
         --img_height $IMG_HEIGHT \
         --img_width $IMG_WIDTH \
         --epochs $EPOCHS
+    echo ""
+    echo "==================================================================="
+    echo "Training complete! Checkpoints saved to $OUTPUT_DIR"
+    echo "==================================================================="
+else
+    echo ""
+    echo "Training skipped by user."
 fi
-
-echo ""
-echo "==================================================================="
-echo "Training complete! Checkpoints saved to $OUTPUT_DIR"
-echo "==================================================================="

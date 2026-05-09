@@ -88,11 +88,13 @@ def process_images(
 
     # Group images into batches
     batches = [image_paths[i:i+batch_size] for i in range(0, len(image_paths), batch_size)]
-    skipped = 0
+    skipped_existing = 0
+    skipped_failed = 0
     processed = 0
 
     with torch.no_grad():
         for batch_idx, batch_paths in enumerate(tqdm(batches, desc="Processing batches")):
+            original_batch_size = len(batch_paths)
             # Filter paths if skip_existing
             if skip_existing:
                 batch_paths = [
@@ -100,7 +102,7 @@ def process_images(
                     if not get_depth_output_path(p, data_root, output_dir).exists()
                 ]
                 if not batch_paths:
-                    skipped += len(batch_paths)
+                    skipped_existing += original_batch_size
                     continue
 
             images_list = []
@@ -113,7 +115,8 @@ def process_images(
                     images_list.append(img_tensor)
                     valid_paths.append(img_path)
                 except Exception as e:
-                    logger.warning(f"Failed to load {img_path}: {e}")
+                    skipped_failed += 1
+                    logger.warn(f"Failed to load {img_path}: {e}")
 
             if not images_list:
                 continue
@@ -126,21 +129,48 @@ def process_images(
 
             # Inference
             try:
-                outputs = model(batch_5d)
-                depths = outputs["depth"]  # (B, 1, H, W)
-                depths = depths.squeeze(1).cpu().numpy()  # (B, H, W)
+                # Call the model - it handles the nested structure internally
+                # The model.predict() or forward() should work with (B, 1, 3, H, W) input
+                with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+                    # Try calling as a forward pass
+                    outputs = model.model(batch_5d)
+                
+                if outputs is None:
+                    logger.error(f"Model returned None for batch {batch_idx}. Checking model attributes...")
+                    logger.error(f"Model type: {type(model)}, Model.model type: {type(model.model)}")
+                    continue
+                
+                if isinstance(outputs, dict):
+                    depths = outputs.get("depth")
+                    if depths is None:
+                        logger.error(f"No 'depth' key in model outputs for batch {batch_idx}. Keys: {list(outputs.keys())}")
+                        continue
+                else:
+                    logger.error(f"Model output is not a dict for batch {batch_idx}: type={type(outputs)}")
+                    continue
+                
+                # depths shape: (B, 1, H, W) or (B, H, W)
+                if depths.dim() == 4:
+                    depths = depths.squeeze(1)  # (B, H, W)
+                
+                depths = depths.cpu().detach().numpy().astype(np.float32)
 
                 # Save each depth map
                 for img_path, depth_map in zip(valid_paths, depths):
                     output_path = get_depth_output_path(img_path, data_root, output_dir)
                     output_path.parent.mkdir(parents=True, exist_ok=True)
-                    np.save(str(output_path), depth_map.astype(np.float32))
+                    np.save(str(output_path), depth_map)
                     processed += 1
 
             except Exception as e:
-                logger.error(f"Inference failed for batch {batch_idx}: {e}")
+                import traceback
+                logger.error(f"Inference failed for batch {batch_idx}: {type(e).__name__}: {e}")
+                logger.debug(traceback.format_exc())
 
-    logger.info(f"Processed {processed} images, skipped {skipped}")
+    logger.info(
+        f"Processed {processed} images | skipped_existing={skipped_existing} | "
+        f"skipped_failed={skipped_failed}"
+    )
 
 
 def main():
@@ -162,12 +192,14 @@ def main():
         model = DepthAnything3(model_name=args.model_name)
 
     model = model.to(device)
+    
+    logger.info(f"Model type: {type(model)}, inner model type: {type(model.model)}")
 
     logger.info(f"Collecting image paths from {data_root}")
     image_paths = get_all_image_paths(data_root)
 
     if not image_paths:
-        logger.warning(f"No image files found under {data_root}")
+        logger.warn(f"No image files found under {data_root}")
         return
 
     logger.info(f"Found {len(image_paths)} images")
